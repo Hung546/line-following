@@ -5,24 +5,26 @@
 #include "motor.h"
 #include <math.h>
 #include <stdbool.h>
-#include <stdio.h>
+
+// Thông số cơ bản
+#define BASE_SPEED 100
+#define BASE_KP 0.005f
+#define BASE_KD 1.0f
 
 line_sensor_t sensor;
 motor_t motor_l, motor_r;
 
-// Tập hợp Trạng thái FSM Thuần (Đã băm nhỏ địa hình và khôi phục Đỉnh nhọn)
+// Các trạng thái
 typedef enum {
-  STATE_STRAIGHT,     // Thẳng tắp (Error < 1200)
-  STATE_SLIGHT_CURVE, // Cong nhẹ (Error 1200 - 1650)
-  STATE_CORNER,       // Góc 90 độ, Zigzag (Error 1650 - 1950)
-  STATE_U_SHAPE,      // Cua tay áo (Error > 1950)
-  STATE_SHARP_PEAK,   // Đỉnh nhọn } (Active >= 6)
-  STATE_LOST          // Nét đứt (Mù)
+  STATE_STRAIGHT,     // Thẳng
+  STATE_SLIGHT_CURVE, // Cong nhẹ
+  STATE_CORNER,       // Góc 90 độ, Zigzag
+  STATE_U_SHAPE,      // Cua gắt
+  STATE_SHARP_PEAK,   // Đỉnh nhọn }
+  STATE_LOST          // Nét đứt
 } robot_state_t;
 
-// ==========================================
-// HÀM 1: FSM NHẬN DIỆN ĐỊA HÌNH TỪ SỐ ĐO THỰC TẾ
-// ==========================================
+// Hàm lấy trạng thái dựa trên dữ liệu lấy từ hàm get_error
 robot_state_t get_robot_state(float error, int active, int contrast,
                               float last_error) {
   float err_abs = fabsf(error);
@@ -31,12 +33,12 @@ robot_state_t get_robot_state(float error, int active, int contrast,
   if (contrast < 400 || active == 0)
     return STATE_LOST;
 
-  // 2. Đỉnh Nhọn } (Ưu tiên tát vỡ "cú lừa trọng tâm")
+  // 2. Đỉnh Nhọn }
   if (active >= 6 && fabsf(last_error) > 1500.0f) {
     return STATE_SHARP_PEAK;
   }
 
-  // 3. Phân lô bán nền theo thông số chuẩn xác đã test
+  // 3. Các trường hợp còn lại
   if (err_abs >= 1950.0f)
     return STATE_U_SHAPE;
   if (err_abs >= 1650.0f || (active >= 5 && err_abs > 1500.0f))
@@ -48,72 +50,69 @@ robot_state_t get_robot_state(float error, int active, int contrast,
   return STATE_STRAIGHT;
 }
 
-// ==========================================
-// HÀM 2: GÁN THÔNG SỐ (GIỮ NGUYÊN BỘ TUNING CỦA BẠN)
-// ==========================================
-// Thêm tham số last_error vào khai báo hàm
+// Hàm gán kp,kd,speed,error sau khi đã có trạng thái của xe
 void set_parameters(robot_state_t state, float *target_speed, float *target_kp,
-                    float *target_kd, float last_error) {
+                    float *target_kd, float raw_error, float last_error,
+                    float *final_error) {
+
+  // Mặc định error là error thô đọc từ sensor
+  *final_error = raw_error;
+
   switch (state) {
   case STATE_STRAIGHT:
-    *target_speed = 100;
-    *target_kp = 0.01f;
-    *target_kd = 1.0f;
+    // P = 0.01, D = 1.0
+    *target_speed = BASE_SPEED;
+    *target_kp = BASE_KP + 0.005f;
+    *target_kd = BASE_KD;
     break;
 
   case STATE_SLIGHT_CURVE:
-    *target_speed = 100;
-    *target_kp = 0.02f;
-    *target_kd = 1.5f;
+    // P = 0.02, D = 1.5
+    *target_speed = BASE_SPEED;
+    *target_kp = BASE_KP + 0.015f;
+    *target_kd = BASE_KD + 0.5f;
     break;
 
   case STATE_CORNER:
-    *target_speed = 50;
-    *target_kp = 0.045f;
-    *target_kd = 3.5f;
+    // P = 0.045, D = 3.5
+    *target_speed = BASE_SPEED - 50;
+    *target_kp = BASE_KP + 0.04f;
+    *target_kd = BASE_KD + 2.5f;
     break;
 
   case STATE_U_SHAPE:
-    *target_speed = 40;
-    *target_kp = 0.045f;
-    *target_kd = 3.5f;
+    // P = 0.045, D = 3.5
+    *target_speed = BASE_SPEED - 60;
+    *target_kp = BASE_KP + 0.04f;
+    *target_kd = BASE_KD + 2.5f;
     break;
 
   case STATE_SHARP_PEAK:
-    // Phanh kịch sàn, lùi lại để triệt tiêu đà tiến
-    *target_speed = -40;
-    *target_kp = 0.10f;
-    *target_kd = 1.0f;
+    // P = 0.10, D = 1.0
+    *target_speed = BASE_SPEED - 140;
+    *target_kp = BASE_KP + 0.095f;
+    *target_kd = BASE_KD;
+
+    *final_error = (last_error > 0) ? 3500.0f : -3500.0f;
     break;
 
   case STATE_LOST:
-    // ====================================================
-    // BỘ NHỚ CHỐNG VĂNG: Kiểm tra xem trước khi mù, xe đang làm gì?
-    // ====================================================
-    if (fabsf(last_error) >= 3000.0f) {
-      // Đang ôm cua cực gắt (hoặc bị ép 3500 ở đỉnh nhọn) mà tự nhiên mù
-      // -> CHẮC CHẮN BỊ VĂNG TRỚN! Giữ nguyên lực phanh và quất đuôi.
-      *target_speed = -20; // Tiếp tục ghì lùi
-      *target_kp = 0.10f;  // Ép vô lăng mạnh để ngoạm lại line
-      *target_kd = 1.0f;
-    } else {
-      // Đang đi thẳng/cong nhẹ mà mù -> ĐÂY LÀ NÉT ĐỨT! Phóng qua.
-      *target_speed = 100;
-      *target_kp = 0.035f;
-      *target_kd = 2.0f;
-    }
+    *final_error = last_error;
+    // P = 0.035, D = 2.0
+    *target_speed = BASE_SPEED;
+    *target_kp = BASE_KP + 0.030f;
+    *target_kd = BASE_KD + 1.0f;
     break;
   }
 }
 
-// ==========================================
 // CHƯƠNG TRÌNH CHÍNH
-// ==========================================
 void app_main(void) {
+  // Khởi tạo Motor
   motor_init(&motor_l, 5, 17, 18, LEDC_CHANNEL_0);
   motor_init(&motor_r, 16, 4, 19, LEDC_CHANNEL_1);
 
-  // Cấu hình Sensor (Chỉ lấy Error, BỎ QUA Gain Scheduling)
+  // Khởi tạo Sensor dò line
   line_sensor_config_t line_cfg = {.pins = {{ADC_UNIT_2, ADC_CHANNEL_9},
                                             {ADC_UNIT_1, ADC_CHANNEL_7},
                                             {ADC_UNIT_2, ADC_CHANNEL_8},
@@ -123,62 +122,43 @@ void app_main(void) {
                                             {ADC_UNIT_1, ADC_CHANNEL_4},
                                             {ADC_UNIT_1, ADC_CHANNEL_0}},
                                    .atten = ADC_ATTEN_DB_12,
-                                   .ema_alpha = 0.25f,
-                                   .gs = {.kp_min = 0,
-                                          .kp_max = 0,
-                                          .kd_min = 0,
-                                          .kd_max = 0,
-                                          .speed_min = 0,
-                                          .speed_max = 0}};
+                                   .ema_alpha = 0.25f};
+
   line_sensor_init(&sensor, &line_cfg);
+  // Bước hiệu chỉnh tính hiệu
   line_sensor_calibrate(&sensor, 5000);
 
-  float last_error = 0, filtered_d = 0;
+  float last_error = 0;
   int mapped[8], contrast, active;
 
-  // Bỏ các biến _raw của GS đi cho nhẹ đầu
-  float unused_kp, unused_kd;
-  int unused_speed;
-
   while (1) {
-    // 1. Lấy dữ liệu thô
+    // 1. Lấy error đo được tại thời điểm đó
     float raw_error =
-        line_sensor_get_error(&sensor, mapped, &contrast, &active, &unused_kp,
-                              &unused_kd, &unused_speed);
+        line_sensor_get_error(&sensor, mapped, &contrast, &active);
 
-    // 2. FSM Quyết định trạng thái (Có truyền thêm last_error)
+    // 2. Lấy trạng thái của xe
     robot_state_t current_state =
         get_robot_state(raw_error, active, contrast, last_error);
 
-    float target_speed, target_kp, target_kd;
+    float target_speed, target_kp, target_kd, final_error;
 
-    // GỌI HÀM MỚI: Truyền last_error vào đây
+    // 3. Gán speed,kp,kd sau khi đã xác định được trạng thái của xe
     set_parameters(current_state, &target_speed, &target_kp, &target_kd,
-                   last_error);
+                   raw_error, last_error, &final_error);
 
-    float final_error = raw_error;
-    if (current_state == STATE_SHARP_PEAK) {
-      // Ép lỗi kịch trần để vắt đuôi
-      final_error = (last_error > 0) ? 3500.0f : -3500.0f;
-    } else if (current_state == STATE_LOST) {
-      // Dùng trí nhớ khi bị mù
-      final_error = last_error;
-    }
-
-    // 5. TÍNH TOÁN PID
+    // 4. Tính PID
     float p_term = final_error * target_kp;
-    float raw_d = (final_error - last_error) * target_kd;
-    filtered_d = (filtered_d * 0.6f) + (raw_d * 0.4f);
+    float d_term = (final_error - last_error) * target_kd;
 
-    float pid_output = p_term + filtered_d;
+    float pid_output = p_term + d_term;
 
-    // Giới hạn PWM bảo vệ phần cứng
+    // Giới hạn PWM bảo vệ Motor
     if (pid_output > 180)
       pid_output = 180;
     if (pid_output < -180)
       pid_output = -180;
 
-    // 6. XUẤT XUNG MOTOR
+    // 5. Xuất xung PWM cho Motor
     motor_set_speed(&motor_l, (int)target_speed + (int)pid_output);
     motor_set_speed(&motor_r, (int)target_speed - (int)pid_output);
 
